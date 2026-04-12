@@ -1,12 +1,18 @@
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
 
+/* ================= CONFIG ================= */
+
 const CONFIG = {
-  ESP_IP: "10.138.103.240",
-  WEBHOOK_SECRET: "smartpay123",
+  KEY_ID: process.env.RAZORPAY_KEY_ID,
+  KEY_SECRET: process.env.RAZORPAY_SECRET,
+  WEBHOOK_SECRET: process.env.RAZORPAY_WEBHOOK_SECRET || "smartpay123",
+  ESP_IP: process.env.ESP_IP || "10.200.188.240",
 
   AMOUNT_DURATION_MAP: {
     10: 10,
@@ -15,20 +21,26 @@ const CONFIG = {
   }
 };
 
-app.use(cors());
+/* ================= DEBUG ================= */
+console.log("🚀 Server starting...");
+console.log("KEY_ID:", CONFIG.KEY_ID ? "Loaded ✅" : "Missing ❌");
+console.log("WEBHOOK_SECRET:", CONFIG.WEBHOOK_SECRET ? "Loaded ✅" : "Missing ❌");
 
-/* 🔥 IMPORTANT FIX */
-app.use("/razorpay-webhook", express.raw({ type: "application/json" }));
+/* ================= MIDDLEWARE ================= */
+
+app.use(cors());
 app.use(express.json());
+
+/* ================= MEMORY ================= */
 
 const processedPayments = new Set();
 
-/* WEBHOOK */
-app.post("/razorpay-webhook", async (req, res) => {
-  console.log("🔥 WEBHOOK HIT");
+/* ================= WEBHOOK ================= */
 
+app.post("/razorpay-webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-    const body = req.body;
+    // ✅ FIXED LINE (only change)
+    const body = req.body instanceof Buffer ? req.body : Buffer.from(JSON.stringify(req.body));
 
     const expectedSignature = crypto
       .createHmac("sha256", CONFIG.WEBHOOK_SECRET)
@@ -38,46 +50,112 @@ app.post("/razorpay-webhook", async (req, res) => {
     const receivedSignature = req.headers["x-razorpay-signature"];
 
     if (expectedSignature !== receivedSignature) {
-      console.log("❌ Invalid signature");
-      return res.status(400).send("Invalid");
+      console.log("❌ Invalid webhook signature");
+      return res.status(400).send("Invalid signature");
     }
+
+    console.log("✅ Webhook verified");
 
     const data = JSON.parse(body.toString());
 
     if (data.event === "payment.captured") {
-
       const payment = data.payload.payment.entity;
+
       const amount = payment.amount / 100;
       const paymentId = payment.id;
 
+      console.log("💰 Payment received:", amount, paymentId);
+
       if (processedPayments.has(paymentId)) {
+        console.log("⚠️ Duplicate payment ignored");
         return res.send("Duplicate");
       }
 
       processedPayments.add(paymentId);
 
-      console.log("💰 Payment:", amount);
-
       const duration = CONFIG.AMOUNT_DURATION_MAP[amount];
 
+      if (!duration) {
+        console.log("⚠️ Unknown amount");
+        return res.send("Ignored");
+      }
+
+      console.log("⏱ Duration:", duration);
+
       try {
-        await fetch(`http://${CONFIG.ESP_IP}/relay?time=${duration}`);
-        console.log("⚡ ESP triggered");
+        const url = `http://${CONFIG.ESP_IP}/relay?time=${duration}`;
+        console.log("👉 Trigger ESP:", url);
+
+        const response = await fetch(url);
+
+        if (!response.ok) throw new Error("ESP failed");
+
+        console.log("✅ ESP triggered");
       } catch (err) {
-        console.log("❌ ESP error:", err.message);
+        console.log("❌ ESP ERROR:", err.message);
       }
     }
 
     res.send("OK");
 
   } catch (err) {
-    console.log("❌ ERROR:", err.message);
+    console.log("❌ WEBHOOK ERROR:", err.message);
     res.status(500).send("Error");
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("🚀 Backend Running");
+/* ================= CREATE ORDER ================= */
+
+app.post("/create-order", async (req, res) => {
+  try {
+    const { amount } = req.body;
+
+    if (!amount) {
+      return res.status(400).json({ error: "Amount required" });
+    }
+
+    const auth = Buffer.from(
+      CONFIG.KEY_ID + ":" + CONFIG.KEY_SECRET
+    ).toString("base64");
+
+    const response = await fetch("https://api.razorpay.com/v1/orders", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Basic ${auth}`
+      },
+      body: JSON.stringify({
+        amount: amount * 100,
+        currency: "INR",
+        receipt: "rcpt_" + Date.now()
+      })
+    });
+
+    const data = await response.json();
+
+    if (data.error) {
+      console.log("❌ Razorpay Error:", data.error);
+      return res.status(400).json(data);
+    }
+
+    res.json(data);
+
+  } catch (err) {
+    console.log("❌ ORDER ERROR:", err.message);
+    res.status(500).send("Error");
+  }
 });
 
-app.listen(3000, () => console.log("🔥 Server running on 3000"));
+/* ================= HEALTH ================= */
+
+app.get("/", (req, res) => {
+  res.send("🚀 SmartPay Backend Running");
+});
+
+/* ================= START ================= */
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`🔥 Server running on port ${PORT}`);
+});
